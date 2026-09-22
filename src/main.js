@@ -339,6 +339,7 @@ app.whenReady().then(() => {
   installEmbedReferer();
   installAdBlock();
   createTray();
+  if (process.argv.includes('--on')) start();
 });
 
 app.on('window-all-closed', () => {
