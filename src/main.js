@@ -6,11 +6,15 @@ const {
   screen,
   nativeImage,
   session,
-  webFrameMain,
 } = require('electron');
 const path = require('path');
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+app.commandLine.appendSwitch(
+  'disable-features',
+  'ExtensionManifestV2Unsupported,ExtensionManifestV2Disabled'
+);
 
 const WINDOW_WIDTH = 280;
 const WINDOW_HEIGHT = 158;
@@ -21,8 +25,37 @@ const TICK_MS = 16;
 const SUBWAY_ID = 'G8N6wAiNL1o';
 const PARKOUR_IDS = ['GG11lZ_K3LY', '0c4KWfPhgWA'];
 
-const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const YT_PARTITION = 'persist:parkour';
+const EMBED_REFERER = 'https://www.google.com/';
+
+function chromeUserAgent() {
+  const chrome = process.versions.chrome;
+  return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chrome} Safari/537.36`;
+}
+
+function setHeader(headers, name, value) {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === name.toLowerCase()) delete headers[key];
+  }
+  headers[name] = value;
+}
+
+function embedUrl(videoId, startAt) {
+  const embed = new URL(`https://www.youtube.com/embed/${videoId}`);
+  embed.search = new URLSearchParams({
+    autoplay: '1',
+    mute: '1',
+    controls: '0',
+    modestbranding: '1',
+    rel: '0',
+    loop: '1',
+    playlist: videoId,
+    start: String(startAt),
+    playsinline: '1',
+    iv_load_policy: '3',
+  }).toString();
+  return embed.toString();
+}
 
 let tray = null;
 let windows = [];
@@ -96,61 +129,114 @@ const AD_SKIP_SCRIPT = `(() => {
     const video = player?.querySelector('video') || document.querySelector('video');
     if (!video) return;
     const ad = !!player && player.classList.contains('ad-showing');
-    if (ad) {
-      video.muted = true;
-      video.playbackRate = 16;
-      if (Number.isFinite(video.duration) && video.duration > 0) {
-        video.currentTime = Math.max(video.duration - 0.05, 0);
-      }
-    } else if (video.playbackRate !== 1) {
-      video.playbackRate = 1;
+    if (!ad) {
+      if (video.playbackRate !== 1) video.playbackRate = 1;
+      return;
+    }
+    video.muted = true;
+    video.playbackRate = 16;
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      video.currentTime = Math.max(video.duration - 0.05, 0);
     }
   };
   pass();
   setInterval(pass, 200);
 })();`;
 
-function installAdBlock() {
-  session.defaultSession.webRequest.onBeforeRequest(
-    {
-      urls: [
-        '*://*.doubleclick.net/*',
-        '*://*.googlesyndication.com/*',
-        '*://*.googleadservices.com/*',
-      ],
-    },
-    (_details, callback) => {
-      callback({ cancel: true });
+function attachAdFilter(win) {
+  const dbg = win.webContents.debugger;
+  try {
+    dbg.attach('1.3');
+  } catch {
+    return;
+  }
+
+  dbg.on('message', async (_event, method, params) => {
+    if (method !== 'Fetch.requestPaused') return;
+    const { requestId, request, responseStatusCode, responseHeaders } = params;
+    const url = request?.url || '';
+    if (!url.includes('/youtubei/v1/player')) {
+      dbg.sendCommand('Fetch.continueRequest', { requestId }).catch(() => {});
+      return;
     }
-  );
+    try {
+      const { body, base64Encoded } = await dbg.sendCommand('Fetch.getResponseBody', { requestId });
+      const text = base64Encoded ? Buffer.from(body, 'base64').toString('utf8') : body;
+      const json = JSON.parse(text);
+      delete json.adPlacements;
+      delete json.playerAds;
+      delete json.adSlots;
+      const headers = (responseHeaders || []).filter((header) => {
+        const name = header.name.toLowerCase();
+        return name !== 'content-encoding' && name !== 'content-length';
+      });
+      await dbg.sendCommand('Fetch.fulfillRequest', {
+        requestId,
+        responseCode: responseStatusCode || 200,
+        responseHeaders: headers,
+        body: Buffer.from(JSON.stringify(json)).toString('base64'),
+      });
+    } catch {
+      dbg.sendCommand('Fetch.continueRequest', { requestId }).catch(() => {});
+    }
+  });
+
+  dbg.sendCommand('Fetch.enable', {
+    patterns: [{ urlPattern: '*youtubei/v1/player*', requestStage: 'Response' }],
+  }).catch(() => {});
 }
 
 function attachAdSkip(win) {
-  win.webContents.on('did-frame-finish-load', (_event, isMainFrame, frameProcessId, frameRoutingId) => {
-    if (isMainFrame) return;
-    let frame;
-    try {
-      frame = webFrameMain.fromId(frameProcessId, frameRoutingId);
-    } catch {
-      return;
-    }
-    if (!frame) return;
-    const url = frame.url || '';
-    if (!url.includes('youtube.com') && !url.includes('youtube-nocookie.com')) return;
-    frame.executeJavaScript(AD_SKIP_SCRIPT).catch(() => {});
+  win.webContents.on('dom-ready', () => {
+    if (win.isDestroyed()) return;
+    const url = win.webContents.getURL();
+    if (!url.includes('youtube.com')) return;
+    win.webContents.executeJavaScript(AD_SKIP_SCRIPT).catch(() => {});
   });
 }
 
-function installEmbedReferer() {
-  session.defaultSession.webRequest.onBeforeSendHeaders(
-    { urls: ['https://www.youtube-nocookie.com/*', 'https://www.youtube.com/*'] },
+const UBLOCK_PATH = path.join(__dirname, '../vendor/ublock-origin/uBlock0.chromium');
+
+async function loadUblock(ses) {
+  const extension = await ses.loadExtension(UBLOCK_PATH);
+  console.log(`uBlock Origin ${extension.version} cargado`);
+}
+
+function installYoutubeSession() {
+  const ses = session.fromPartition(YT_PARTITION);
+  const ua = chromeUserAgent();
+  const major = process.versions.chrome.split('.')[0];
+  ses.setUserAgent(ua);
+
+  ses.webRequest.onBeforeSendHeaders(
+    {
+      urls: [
+        '*://*.youtube.com/*',
+        '*://*.googlevideo.com/*',
+        '*://*.ytimg.com/*',
+        '*://*.ggpht.com/*',
+        '*://*.google.com/*',
+        '*://*.gstatic.com/*',
+      ],
+    },
     (details, callback) => {
       const headers = details.requestHeaders;
-      const refererKey = Object.keys(headers).find((name) => name.toLowerCase() === 'referer');
-      if (!refererKey) headers.Referer = 'https://www.google.com/';
+      setHeader(headers, 'User-Agent', ua);
+      setHeader(
+        headers,
+        'Sec-CH-UA',
+        `"Chromium";v="${major}", "Google Chrome";v="${major}", "Not?A_Brand";v="24"`
+      );
+      setHeader(headers, 'Sec-CH-UA-Mobile', '?0');
+      setHeader(headers, 'Sec-CH-UA-Platform', '"macOS"');
+      const isEmbed = details.url.includes('youtube.com/embed/');
+      const hasReferer = Object.keys(headers).some((key) => key.toLowerCase() === 'referer');
+      if (isEmbed && !hasReferer) setHeader(headers, 'Referer', EMBED_REFERER);
       callback({ requestHeaders: headers });
     }
   );
+
+  return ses;
 }
 
 function createTray() {
@@ -206,6 +292,7 @@ function createHiddenWindow(index, gen) {
     roundedCorners: true,
     backgroundColor: '#000000',
     webPreferences: {
+      partition: YT_PARTITION,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -217,18 +304,17 @@ function createHiddenWindow(index, gen) {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.setIgnoreMouseEvents(true);
   win.webContents.setBackgroundThrottling(false);
-  win.webContents.setUserAgent(CHROME_UA);
+  win.webContents.setUserAgent(chromeUserAgent());
   win.setOpacity(0);
   win.showInactive();
+  attachAdFilter(win);
   attachAdSkip(win);
   win.webContents.on('media-started-playing', () => {
     markReady(win, gen);
   });
 
   const videoId = videoFor(index);
-  win.loadFile(path.join(__dirname, 'player.html'), {
-    query: { v: videoId, start: String(startAt) },
-  });
+  win.loadURL(embedUrl(videoId, startAt));
 
   return win;
 }
@@ -332,12 +418,17 @@ function setCount(next) {
   if (active) start();
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (process.platform === 'darwin') {
     app.setActivationPolicy('accessory');
   }
-  installEmbedReferer();
-  installAdBlock();
+  app.userAgentFallback = chromeUserAgent();
+  const ses = installYoutubeSession();
+  try {
+    await loadUblock(ses);
+  } catch (error) {
+    console.error('No se pudo cargar uBlock Origin:', error);
+  }
   createTray();
   if (process.argv.includes('--on')) start();
 });
